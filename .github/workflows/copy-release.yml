@@ -1067,12 +1067,12 @@ jobs:
                   for raw in pat.findall(path.read_text(encoding='utf-8',errors='ignore')):
                       img=norm(raw)
                       if img and img not in local: images.add(img)
-          targets={}
+          # 多个 Registry 可能发布同一镜像，例如 Docker Hub 与 GHCR 的 rustdesk-server。
+          # 不再因目标名相同而失败；这里保留多行，后续按目标名合并为候选源列表。
           with out.open('w',encoding='utf-8') as f:
               for img in sorted(images):
                   target=re.sub(r'[^a-z0-9._-]+','-',img.rsplit('/',1)[-1]).strip('._-')
-                  if target in targets and targets[target]!=img: raise SystemExit(f'目标名冲突：{targets[target]} / {img} -> {target}')
-                  targets[target]=img; f.write(f'{img}\t{target}\t\n')
+                  f.write(f'{img}\t{target}\t\n')
           PYCODE
 
           if [ "${SOURCE_KIND}" = "github" ]; then
@@ -1253,7 +1253,35 @@ jobs:
               echo "::warning::认证及匿名方式均无法枚举 GitHub Packages。认证错误：$(cat "${WORK}/packages.err" 2>/dev/null || true)"
             fi
           fi
-          cat "${PACKAGE_OUT}" "${COMPOSE_OUT}" | awk -F '\t' '!seen[$1]++' > "${OUT}"
+          # 先按源地址去重，再按目标名合并候选源。第四列保留手动独立 Tag；
+          # 自动发现的同目标源会合并为逗号分隔列表，优先顺序为 GHCR、Docker Hub、其他 Registry。
+          cat "${PACKAGE_OUT}" "${COMPOSE_OUT}" | awk -F '\t' '!seen[$1]++' > "${WORK}/discovered-all.tsv"
+          python3 - "${WORK}/discovered-all.tsv" "${OUT}" <<'PYMERGE'
+          import sys
+          from collections import OrderedDict
+          src_path,out_path=sys.argv[1],sys.argv[2]
+          groups=OrderedDict()
+          def rank(src):
+              if src.startswith('ghcr.io/'): return (0,src)
+              if src.startswith('docker.io/'): return (1,src)
+              return (2,src)
+          for raw in open(src_path,encoding='utf-8'):
+              parts=raw.rstrip('\n').split('\t')
+              if len(parts)<2 or not parts[0] or not parts[1]: continue
+              src,target=parts[0],parts[1]
+              package_tags=parts[2] if len(parts)>2 else ''
+              mapping_tag=parts[3] if len(parts)>3 else ''
+              item=groups.setdefault(target,{'sources':[],'package_tags':'','mapping_tag':''})
+              if src not in item['sources']: item['sources'].append(src)
+              if package_tags and package_tags!='__no_package_tags__': item['package_tags']=package_tags
+              if mapping_tag: item['mapping_tag']=mapping_tag
+          with open(out_path,'w',encoding='utf-8') as out:
+              for target,item in groups.items():
+                  sources=sorted(item['sources'],key=rank)
+                  out.write('\t'.join([','.join(sources),target,item['package_tags'] or '__no_package_tags__',item['mapping_tag']])+'\n')
+                  if len(sources)>1:
+                      print(f"同目标候选源已合并：{target} <- {', '.join(sources)}")
+          PYMERGE
           [ -s "${OUT}" ] || { echo "::error::没有从源码或 GitHub Packages 读取到镜像。若上游包公开但仍失败，请为 WORKFLOW_PAT 添加 classic read:packages；也可手动填写 image_mappings"; exit 1; }
           echo "map_file=${OUT}" >> "${GITHUB_OUTPUT}"
           echo "自动发现映射（第3列非空表示使用包自身标签）："; cat "${OUT}"
@@ -1324,7 +1352,7 @@ jobs:
             while IFS=$'\t' read -r registry username password; do [ -n "${registry}" ] && login_one "${registry}" "${username}" "${password}"; done < "${AUTH_MAP}"
           elif [ -n "${SOURCE_USERNAME}" ] || [ -n "${SOURCE_TOKEN}" ]; then
             [ -n "${SOURCE_USERNAME}" ] && [ -n "${SOURCE_TOKEN}" ] || { echo "::error::SOURCE_REGISTRY_USERNAME 和 SOURCE_REGISTRY_TOKEN 必须同时设置"; exit 1; }
-            if cut -f1 "${MAP}" | awk -F/ '{print $1}' | grep -Fxq 'docker.io'; then
+            if cut -f1 "${MAP}" | tr ',' '\n' | awk -F/ '{print $1}' | grep -Fxq 'docker.io'; then
               login_one "docker.io" "${SOURCE_USERNAME}" "${SOURCE_TOKEN}"
               echo "全局 SOURCE_REGISTRY_USERNAME/TOKEN 仅应用于 docker.io；其他 Registry 保持匿名，或使用映射内独立账号。"
             else
@@ -1357,14 +1385,14 @@ jobs:
             TAG_FILE="${RUNNER_TEMP}/tags-$(printf '%s' "${target_name}" | tr '/:' '--').txt"
             if [ -n "${mapping_tag:-}" ]; then
               printf '%s\n' "${mapping_tag}" > "${TAG_FILE}"
-              echo "${source_image} 使用该映射自身独立 Tag：${mapping_tag}。"
+              echo "候选源 ${source_image} 使用该映射自身独立 Tag：${mapping_tag}。"
             elif [ -n "${package_tags:-}" ] && [ "${package_tags}" != '__no_package_tags__' ]; then
               printf '%s' "${package_tags}" | tr ',' '\n' | sed '/^$/d' | sort -V > "${TAG_FILE}"
-              echo "${source_image} 使用 GitHub Package 自身标签，共 $(wc -l < "${TAG_FILE}" | xargs) 个。"
+              echo "候选源 ${source_image} 使用 GitHub Package 自身标签，共 $(wc -l < "${TAG_FILE}" | xargs) 个。"
             else
               jq -r '.[].tagName | select(. != "__mapping_tag__")' "${VERSIONS}" > "${TAG_FILE}"
               [ -s "${TAG_FILE}" ] || { echo "::error::${source_image} 没有独立 Tag，也没有公共 tag/tag_list"; FAIL=$((FAIL+1)); continue; }
-              echo "${source_image} 使用 Release/clean_snapshot 或公共版本列表。"
+              echo "候选源 ${source_image} 使用 Release/clean_snapshot 或公共版本列表。"
             fi
             while IFS= read -r release_tag; do
               [ -n "${release_tag}" ] || continue
@@ -1373,19 +1401,25 @@ jobs:
               if [ "${STRIP_V_PREFIX}" = true ] && [[ "${release_tag}" == v* ]]; then CANDIDATES+=("${release_tag#v}" "${release_tag}");
               else CANDIDATES+=("${release_tag}"); if [[ "${release_tag}" == v* ]]; then CANDIDATES+=("${release_tag#v}"); else CANDIDATES+=("v${release_tag}"); fi; fi
               source_ref=""; checked=""; probe_errors=""; only_not_found=true
-              for candidate in "${CANDIDATES[@]}"; do
-                ref="${source_image}:${candidate}"; checked="${checked:+${checked}, }${ref}"
-                PROBE_FILE="${RUNNER_TEMP}/crane-source-probe.txt"
-                if crane manifest "${ref}" > /dev/null 2>"${PROBE_FILE}"; then
-                  source_ref="${ref}"; break
-                fi
-                probe_message="$(tr '\n' ' ' < "${PROBE_FILE}" | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
-                [ -n "${probe_message}" ] || probe_message="crane manifest 未返回错误文本"
-                echo "::warning::源镜像检查失败：${ref} | ${probe_message}"
-                probe_errors="${probe_errors}${probe_errors:+ | }${ref}: ${probe_message}"
-                if ! printf '%s' "${probe_message}" | grep -Eqi 'manifest unknown|name unknown|not found|404|unknown tag'; then
-                  only_not_found=false
-                fi
+              IFS=',' read -r -a SOURCE_IMAGES <<< "${source_image}"
+              for one_source_image in "${SOURCE_IMAGES[@]}"; do
+                [ -n "${one_source_image}" ] || continue
+                for candidate in "${CANDIDATES[@]}"; do
+                  ref="${one_source_image}:${candidate}"; checked="${checked:+${checked}, }${ref}"
+                  PROBE_FILE="${RUNNER_TEMP}/crane-source-probe.txt"
+                  if crane manifest "${ref}" > /dev/null 2>"${PROBE_FILE}"; then
+                    source_ref="${ref}"
+                    echo "候选源命中：${source_ref}"
+                    break 2
+                  fi
+                  probe_message="$(tr '\n' ' ' < "${PROBE_FILE}" | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
+                  [ -n "${probe_message}" ] || probe_message="crane manifest 未返回错误文本"
+                  echo "::warning::源镜像检查失败：${ref} | ${probe_message}"
+                  probe_errors="${probe_errors}${probe_errors:+ | }${ref}: ${probe_message}"
+                  if ! printf '%s' "${probe_message}" | grep -Eqi 'manifest unknown|name unknown|not found|404|unknown tag'; then
+                    only_not_found=false
+                  fi
+                done
               done
               if [ -z "${source_ref}" ]; then
                 if [ "${only_not_found}" = true ]; then
@@ -1405,7 +1439,27 @@ jobs:
                   echo "::warning::目标镜像存在性检查返回非缺失错误，将继续尝试复制：${target_ref} | ${target_probe_message}"
                 fi
               fi
-              if crane copy "${source_ref}" "${target_ref}"; then echo "成功 ${source_ref} -> ${target_ref}" >> "${SUMMARY}"; last="${source_ref}"; OK=$((OK+1)); else echo "失败 ${source_ref}" >> "${SUMMARY}"; FAIL=$((FAIL+1)); fi
+              copy_ok=false
+              COPY_FILE="${RUNNER_TEMP}/crane-copy-error.txt"
+              if crane copy "${source_ref}" "${target_ref}" 2> >(tee "${COPY_FILE}" >&2); then
+                echo "成功 ${source_ref} -> ${target_ref}" >> "${SUMMARY}"; last="${source_ref}"; OK=$((OK+1)); copy_ok=true
+              else
+                first_copy_error="$(tr '\n' ' ' < "${COPY_FILE}" | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
+                echo "::warning::首选源复制失败，将尝试同目标其他候选源：${source_ref} | ${first_copy_error}"
+                for fallback_image in "${SOURCE_IMAGES[@]}"; do
+                  [ -n "${fallback_image}" ] || continue
+                  for fallback_tag in "${CANDIDATES[@]}"; do
+                    fallback_ref="${fallback_image}:${fallback_tag}"
+                    [ "${fallback_ref}" != "${source_ref}" ] || continue
+                    if ! crane manifest "${fallback_ref}" > /dev/null 2>"${PROBE_FILE}"; then continue; fi
+                    echo "尝试备用候选源复制：${fallback_ref} -> ${target_ref}"
+                    if crane copy "${fallback_ref}" "${target_ref}" 2> >(tee "${COPY_FILE}" >&2); then
+                      echo "备用源成功 ${fallback_ref} -> ${target_ref}" >> "${SUMMARY}"; last="${fallback_ref}"; OK=$((OK+1)); copy_ok=true; break 2
+                    fi
+                  done
+                done
+                if [ "${copy_ok}" != true ]; then echo "失败 ${source_ref}；所有候选源均未能完成复制" >> "${SUMMARY}"; FAIL=$((FAIL+1)); fi
+              fi
             done < "${TAG_FILE}"
             if [ "${UPDATE_LATEST}" = true ] && [ -n "${last}" ]; then
               if crane copy "${last}" "${target_image}:latest"; then echo "latest 更新成功：${last} -> ${target_image}:latest" >> "${SUMMARY}"; else echo "latest 更新失败：${last} -> ${target_image}:latest" >> "${SUMMARY}"; FAIL=$((FAIL+1)); fi
