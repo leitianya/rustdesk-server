@@ -1460,12 +1460,51 @@ jobs:
               fi
               if [ "${SKIP_EXISTING}" = true ]; then
                 TARGET_PROBE_FILE="${RUNNER_TEMP}/crane-target-probe.txt"
+                SOURCE_DIGEST_FILE="${RUNNER_TEMP}/crane-source-digest.txt"
+                TARGET_DIGEST_FILE="${RUNNER_TEMP}/crane-target-digest.txt"
+                TARGET_VALIDATE_FILE="${RUNNER_TEMP}/crane-target-validate.txt"
+                source_digest=""; target_digest=""; target_manifest_exists=false; target_complete=false
+
+                # 保留原有目标 Manifest 存在性检查，但不再仅凭“能读取 Manifest”就跳过。
                 if crane manifest "${target_ref}" > /dev/null 2>"${TARGET_PROBE_FILE}"; then
-                  echo "跳过 ${target_ref}；latest 候选=${source_ref}" >> "${SUMMARY}"; last="${source_ref}"; SKIP=$((SKIP+1)); continue
+                  target_manifest_exists=true
+                else
+                  target_probe_message="$(tr '\n' ' ' < "${TARGET_PROBE_FILE}" | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
+                  if [ -n "${target_probe_message}" ] && ! printf '%s' "${target_probe_message}" | grep -Eqi 'manifest unknown|name unknown|not found|404|unknown tag'; then
+                    echo "::warning::目标镜像存在性检查返回非缺失错误，将继续尝试复制：${target_ref} | ${target_probe_message}"
+                  fi
                 fi
-                target_probe_message="$(tr '\n' ' ' < "${TARGET_PROBE_FILE}" | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
-                if [ -n "${target_probe_message}" ] && ! printf '%s' "${target_probe_message}" | grep -Eqi 'manifest unknown|name unknown|not found|404|unknown tag'; then
-                  echo "::warning::目标镜像存在性检查返回非缺失错误，将继续尝试复制：${target_ref} | ${target_probe_message}"
+
+                if [ "${target_manifest_exists}" = true ]; then
+                  if source_digest="$(crane digest "${source_ref}" 2>"${SOURCE_DIGEST_FILE}")"; then :; else
+                    source_digest=""
+                    source_digest_message="$(tr '\n' ' ' < "${SOURCE_DIGEST_FILE}" | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
+                    echo "::warning::无法读取源镜像 Digest，不允许直接跳过：${source_ref} | ${source_digest_message}"
+                  fi
+                  if target_digest="$(crane digest "${target_ref}" 2>"${TARGET_DIGEST_FILE}")"; then :; else
+                    target_digest=""
+                    target_digest_message="$(tr '\n' ' ' < "${TARGET_DIGEST_FILE}" | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
+                    echo "::warning::无法读取目标镜像 Digest，将重新复制：${target_ref} | ${target_digest_message}"
+                  fi
+                  if crane validate --remote "${target_ref}" > /dev/null 2>"${TARGET_VALIDATE_FILE}"; then
+                    target_complete=true
+                  else
+                    target_validate_message="$(tr '\n' ' ' < "${TARGET_VALIDATE_FILE}" | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
+                    echo "::warning::目标镜像完整性验证失败，将重新复制修复：${target_ref} | ${target_validate_message}"
+                  fi
+
+                  if [ -n "${source_digest}" ] && [ -n "${target_digest}" ] && [ "${source_digest}" = "${target_digest}" ] && [ "${target_complete}" = true ]; then
+                    echo "跳过 ${target_ref}；源目标 Digest 一致且目标完整；latest 候选=${source_ref}" >> "${SUMMARY}"
+                    last="${source_ref}"; SKIP=$((SKIP+1)); continue
+                  fi
+
+                  if [ -n "${source_digest}" ] && [ -n "${target_digest}" ] && [ "${source_digest}" != "${target_digest}" ]; then
+                    echo "::warning::目标 Digest 与源不一致，将重新复制：${target_ref} | 源=${source_digest} | 目标=${target_digest}"
+                  elif [ "${target_complete}" != true ]; then
+                    echo "::warning::目标 Tag 可读取但镜像不完整，将重新复制：${target_ref}"
+                  else
+                    echo "::warning::目标镜像无法完成严格一致性确认，将重新复制：${target_ref}"
+                  fi
                 fi
               fi
               copy_ok=false
