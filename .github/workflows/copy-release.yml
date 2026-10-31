@@ -1024,6 +1024,14 @@ jobs:
           COMPOSE_OUT="${RUNNER_TEMP}/compose-image-mappings.tsv"; PACKAGE_OUT="${RUNNER_TEMP}/package-image-mappings.tsv"
           trap 'rm -rf "${WORK}"' EXIT
           :>"${COMPOSE_OUT}"; :>"${PACKAGE_OUT}"
+          # src_repo 非 none 时，版本已在 prepare 阶段精准筛选完成。
+          # 自动发现阶段只发现镜像地址，不再实际执行 Package 全标签枚举；
+          # 原有枚举代码完整保留在兼容分支中，避免改变 none/旧逻辑能力。
+          USE_PRESELECTED_VERSIONS=false
+          if [ "${SOURCE_REPO}" != "none" ]; then
+            USE_PRESELECTED_VERSIONS=true
+            echo "非 none 源码模式：复用前期精准版本；自动发现仅查找镜像地址。"
+          fi
           if [ "${SOURCE_KIND}" = "github" ]; then
             gh api -H 'Accept: application/vnd.github+json' "repos/${SOURCE_REPO}/tarball" > "${WORK}/source.tar.gz"
             mkdir -p "${SRC_DIR}"; tar -xzf "${WORK}/source.tar.gz" -C "${SRC_DIR}" --strip-components=1
@@ -1142,6 +1150,7 @@ jobs:
               fi
               for page in $(seq 1 50); do
                 [ -n "${PACKAGE_PAGE_BASE}" ] || break
+                BEFORE_COUNT="$(sort -u "${WEB_PACKAGES}" | sed '/^$/d' | wc -l | xargs)"
                 if [[ "${PACKAGE_PAGE_BASE}" == "https://github.com/${OWNER}" ]]; then
                   PAGE_URL="${PACKAGE_PAGE_BASE}?tab=packages&repo_name=${REPO_NAME}&page=${page}"
                 else
@@ -1153,8 +1162,12 @@ jobs:
                 HTML_FILE="${WORK}/packages-page.html" OWNER_VALUE="${OWNER}" REPO_VALUE="${REPO_NAME}" \
                   python3 -c 'import html,os,re; from pathlib import Path; from urllib.parse import unquote; text=html.unescape(Path(os.environ["HTML_FILE"]).read_text(encoding="utf-8",errors="ignore")); owner=os.environ["OWNER_VALUE"]; repo=os.environ["REPO_VALUE"]; pattern=rf"/(?:users|orgs)/{re.escape(owner)}/packages/container/(?:package/)?([^\"?#< ]+)"; print("\n".join(unquote(x).strip("/") for x in re.findall(pattern,text,re.I) if unquote(x).strip("/")))' \
                   >> "${WEB_PACKAGES}"
-                COUNT="$(sort -u "${WEB_PACKAGES}" | wc -l | xargs)"
+                COUNT="$(sort -u "${WEB_PACKAGES}" | sed '/^$/d' | wc -l | xargs)"
                 echo "Packages 网页第 ${page} 页，累计发现 ${COUNT} 个包。"
+                if [ "${COUNT}" -eq "${BEFORE_COUNT}" ]; then
+                  echo "Packages 网页本页没有新增包，停止继续翻页。"
+                  break
+                fi
                 grep -qiE 'Next|下一页' "${WORK}/packages-page.html" || break
               done
               sort -u "${WEB_PACKAGES}" -o "${WEB_PACKAGES}"
@@ -1163,14 +1176,19 @@ jobs:
                 while IFS= read -r NAME; do
                   [ -n "${NAME}" ] || continue
                   SOURCE_IMAGE="ghcr.io/${OWNER,,}/${NAME,,}"
-                  TAGS="$(crane ls "${SOURCE_IMAGE}" 2>/dev/null | sort -V | paste -sd, - || true)"
-                  if [ -z "${TAGS}" ]; then
-                    # 页面顶部会明确显示 latest；crane ls 被限流时仍先保留 latest。
-                    TAGS="latest"
-                    echo "::warning::无法列出 ${SOURCE_IMAGE} 的标签，回退尝试 latest。"
+                  if [ "${USE_PRESELECTED_VERSIONS}" = true ]; then
+                    printf '%s\t%s\t%s\n' "${SOURCE_IMAGE}" "${NAME,,}" "__no_package_tags__" >> "${PACKAGE_OUT}"
+                    echo "网页发现 GitHub Package：${SOURCE_IMAGE}；复用前期精准版本，不再枚举 Package 全部标签。"
+                  else
+                    TAGS="$(crane ls "${SOURCE_IMAGE}" 2>/dev/null | sort -V | paste -sd, - || true)"
+                    if [ -z "${TAGS}" ]; then
+                      # 页面顶部会明确显示 latest；crane ls 被限流时仍先保留 latest。
+                      TAGS="latest"
+                      echo "::warning::无法列出 ${SOURCE_IMAGE} 的标签，回退尝试 latest。"
+                    fi
+                    printf '%s\t%s\t%s\n' "${SOURCE_IMAGE}" "${NAME,,}" "${TAGS}" >> "${PACKAGE_OUT}"
+                    echo "网页发现 GitHub Package：${SOURCE_IMAGE}；标签=${TAGS}"
                   fi
-                  printf '%s\t%s\t%s\n' "${SOURCE_IMAGE}" "${NAME,,}" "${TAGS}" >> "${PACKAGE_OUT}"
-                  echo "网页发现 GitHub Package：${SOURCE_IMAGE}；标签=${TAGS}"
                 done < "${WEB_PACKAGES}"
               fi
             fi
@@ -1216,6 +1234,13 @@ jobs:
               while IFS= read -r package; do
                 [ -n "${package}" ] || continue
                 NAME="$(jq -r '.name' <<<"${package}")"
+                if [ "${USE_PRESELECTED_VERSIONS}" = true ]; then
+                  SOURCE_IMAGE="ghcr.io/${OWNER,,}/${NAME,,}"
+                  TARGET_NAME="${NAME,,}"
+                  printf '%s\t%s\t%s\n' "${SOURCE_IMAGE}" "${TARGET_NAME}" "__no_package_tags__" >> "${PACKAGE_OUT}"
+                  echo "发现关联 GitHub Package：${SOURCE_IMAGE}；复用前期精准版本，不再枚举 Package 全部标签。"
+                  continue
+                fi
                 ENCODED="$(jq -rn --arg v "${NAME}" '$v|@uri')"
                 VERSIONS_OK=false
                 if gh api --paginate --slurp "${PKG_ENDPOINT}/container/${ENCODED}/versions?per_page=100" > "${WORK}/versions.json" 2>/dev/null; then
@@ -1386,10 +1411,10 @@ jobs:
             if [ -n "${mapping_tag:-}" ]; then
               printf '%s\n' "${mapping_tag}" > "${TAG_FILE}"
               echo "候选源 ${source_image} 使用该映射自身独立 Tag：${mapping_tag}。"
-            elif [ "${TAG_SYNC_MODE}" = 'clean_snapshot' ]; then
+            elif [ "${SOURCE_REPO}" != 'none' ]; then
               jq -r '.[].tagName | select(. != "__mapping_tag__")' "${VERSIONS}" > "${TAG_FILE}"
-              [ -s "${TAG_FILE}" ] || { echo "::error::${source_image} 在 clean_snapshot 模式下没有选中的精准版本"; FAIL=$((FAIL+1)); continue; }
-              echo "候选源 ${source_image} 随 clean_snapshot 使用已筛选精准版本，共 $(wc -l < "${TAG_FILE}" | xargs) 个。"
+              [ -s "${TAG_FILE}" ] || { echo "::error::${source_image} 在非 none 源码模式下没有前期已选精准版本"; FAIL=$((FAIL+1)); continue; }
+              echo "候选源 ${source_image} 使用前期已筛选精准版本，共 $(wc -l < "${TAG_FILE}" | xargs) 个；不再枚举 Package 全部标签。"
             elif [ -n "${package_tags:-}" ] && [ "${package_tags}" != '__no_package_tags__' ]; then
               printf '%s' "${package_tags}" | tr ',' '\n' | sed '/^$/d' | sort -V > "${TAG_FILE}"
               echo "候选源 ${source_image} 使用 GitHub Package 自身标签，共 $(wc -l < "${TAG_FILE}" | xargs) 个。"
